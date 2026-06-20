@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+.env
+.env.*
+
+# Generated files
+generated/
+*.docx
+
+# Backup files
+*.bak
+*.backup
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Keep Word template
+!templates/
+!templates/lesson_template.docx

@@ -1,0 +1,386 @@
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from datetime import datetime
+from uuid import uuid4
+from pathlib import Path
+
+from docx import Document
+from docx.shared import Pt
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
+
+
+BASE_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = BASE_DIR / "generated"
+TEMPLATE_DIR = BASE_DIR / "templates"
+TEMPLATE_PATH = TEMPLATE_DIR / "lesson_template.docx"
+
+OUTPUT_DIR.mkdir(exist_ok=True)
+TEMPLATE_DIR.mkdir(exist_ok=True)
+
+PUBLIC_BASE_URL = "http://159.75.10.144:8000"
+
+app = FastAPI(title="Lesson Plan API", version="0.5.0")
+app.mount("/files", StaticFiles(directory=str(OUTPUT_DIR)), name="files")
+
+
+class TeachingObjectives(BaseModel):
+    knowledge: str | None = None
+    ability: str | None = None
+    quality: str | None = None
+
+
+class LessonData(BaseModel):
+    teaching_objectives: TeachingObjectives | None = None
+    ideological_goal: str | None = None
+    key_points: str | None = None
+    difficult_points: str | None = None
+    teaching_design: str | None = None
+    reflection: str | None = None
+    references: list[str] | None = None
+
+
+class LessonDocxRequest(BaseModel):
+    course_name: str | None = None
+    lesson_topic: str | None = None
+    teacher_name: str | None = None
+    class_name: str | None = None
+    semester: str | None = None
+    college: str | None = None
+    teaching_group: str | None = None
+    lesson_date: str | None = None
+    lesson_time: str | None = None
+    hours: str | None = None
+    lesson_data: LessonData | None = None
+
+
+def value_or_default(value, default=""):
+    return value if value else default
+
+
+def set_cell_text(cell, text: str):
+    """
+    清空单元格并写入文本。
+    注意：模板里存在合并单元格，python-docx 仍可通过指定位置写入。
+    """
+    cell.text = ""
+    p = cell.paragraphs[0]
+    run = p.add_run(text or "")
+
+    run.font.name = "宋体"
+    run._element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+    run.font.size = Pt(10.5)
+
+
+def build_objectives_text(objectives: TeachingObjectives | None) -> str:
+    objectives = objectives or TeachingObjectives()
+
+    knowledge = value_or_default(objectives.knowledge, "掌握本次课相关基础知识、核心概念和基本原理。")
+    ability = value_or_default(objectives.ability, "能够结合实际任务分析和解决本次课相关问题。")
+    quality = value_or_default(objectives.quality, "培养学生严谨细致、规范操作和理论联系实际的职业素养。")
+
+    return f"知识目标：{knowledge}\n能力目标：{ability}\n素养目标：{quality}"
+
+
+def build_key_difficult_text(lesson_data: LessonData) -> str:
+    key_points = value_or_default(lesson_data.key_points, "本次课相关核心概念、基本原理和应用方法。")
+    difficult_points = value_or_default(lesson_data.difficult_points, "本次课抽象知识点的理解及其在实际问题中的应用。")
+
+    return f"教学重点：{key_points}\n教学难点：{difficult_points}"
+
+
+def build_references_text(references: list[str] | None) -> str:
+    default_refs = [
+        "[1] 康华光. 电子技术基础：模拟部分[M]. 北京: 高等教育出版社, 2021.",
+        "[2] 秦曾煌. 电工学[M]. 北京: 高等教育出版社, 2018.",
+        "[3] 童诗白, 华成英. 模拟电子技术基础[M]. 北京: 高等教育出版社, 2015."
+    ]
+
+    refs = references or default_refs
+    return "\n".join(refs)
+
+
+def set_cover_paragraph(paragraph, label: str, value: str):
+    """
+    填充封面普通段落，例如：课程名称、编写教师、授课班级等。
+    保留段落本身位置，重新写入“标签 + 下划线内容”。
+    """
+    paragraph.clear()
+
+    label_run = paragraph.add_run(f"{label}：")
+    label_run.bold = True
+    label_run.font.name = "黑体"
+    label_run._element.rPr.rFonts.set(qn("w:eastAsia"), "黑体")
+    label_run.font.size = Pt(16)
+
+    value_run = paragraph.add_run(f"  {value or ''}  ")
+    value_run.underline = True
+    value_run.font.name = "宋体"
+    value_run._element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+    value_run.font.size = Pt(16)
+
+
+def fill_cover_info(doc, data: LessonDocxRequest):
+    """
+    填充封面信息。
+    这些内容通常不是表格，而是 Word 普通段落。
+    """
+    cover_map = {
+        "课程名称": value_or_default(data.course_name),
+        "编写教师": value_or_default(data.teacher_name),
+        "授课班级": value_or_default(data.class_name),
+        "授课学期": value_or_default(data.semester),
+        "教研室（组）": value_or_default(getattr(data, "teaching_group", ""), ""),
+        "二级学院": value_or_default(data.college)
+    }
+
+    for paragraph in doc.paragraphs:
+        text = paragraph.text.strip()
+        for label, value in cover_map.items():
+            if label in text:
+                set_cover_paragraph(paragraph, label, value)
+                break
+
+
+
+def insert_page_break_before_first_table(doc):
+    """
+    在第一个表格前强制插入分页符。
+    用于恢复“封面”和“教案表格”之间的分页。
+    """
+    if not doc.tables:
+        return
+
+    first_table = doc.tables[0]
+    table_element = first_table._tbl
+
+    p = OxmlElement("w:p")
+    r = OxmlElement("w:r")
+    br = OxmlElement("w:br")
+    br.set(qn("w:type"), "page")
+    r.append(br)
+    p.append(r)
+
+    table_element.addprevious(p)
+
+
+def fill_template_docx(data: LessonDocxRequest) -> str:
+    if not TEMPLATE_PATH.exists():
+        raise FileNotFoundError(f"模板文件不存在: {TEMPLATE_PATH}")
+
+    doc = Document(TEMPLATE_PATH)
+
+    # 先填充封面信息
+    fill_cover_info(doc, data)
+
+    if len(doc.tables) == 0:
+        raise ValueError("模板中没有表格，无法填充。")
+
+    table = doc.tables[0]
+    lesson_data = data.lesson_data or LessonData()
+
+    # 顶部基本信息区：只填写第一组授课班级和日期
+    # 同一个班级和上课时间只填写一次，不再复制到右侧区域
+    set_cell_text(table.cell(0, 1), value_or_default(data.class_name))
+    set_cell_text(table.cell(0, 3), value_or_default(data.lesson_date))
+
+    # 主体内容区
+    set_cell_text(table.cell(4, 1), value_or_default(data.lesson_topic, "未填写授课章节"))
+    set_cell_text(table.cell(5, 1), build_objectives_text(lesson_data.teaching_objectives))
+
+    ideological_goal = value_or_default(
+        lesson_data.ideological_goal,
+        "结合本次课程内容，引导学生树立规范意识、工程意识和责任意识，培养精益求精的职业精神。"
+    )
+    set_cell_text(table.cell(6, 1), ideological_goal)
+
+    set_cell_text(table.cell(7, 1), build_key_difficult_text(lesson_data))
+
+    teaching_design = value_or_default(
+        lesson_data.teaching_design,
+        "本次课围绕授课主题展开，先通过案例或问题情境导入，引导学生明确学习任务；随后讲解核心知识点，结合提问、演示、案例分析和任务训练促进学生理解；最后进行课堂总结，帮助学生梳理知识结构。"
+    )
+    set_cell_text(table.cell(8, 1), teaching_design)
+
+    reflection = value_or_default(
+        lesson_data.reflection,
+        "本次课整体教学过程较为顺利，学生能够跟随课堂任务完成学习。后续教学中应结合学生反馈进一步优化案例设计和课堂互动，提高学生对重点难点内容的理解与应用能力。"
+    )
+    set_cell_text(table.cell(9, 1), reflection)
+
+    set_cell_text(table.cell(10, 1), build_references_text(lesson_data.references))
+
+    filename = f"template_lesson_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}.docx"
+    file_path = OUTPUT_DIR / filename
+    doc.save(file_path)
+
+    return filename
+
+
+@app.get("/")
+def root():
+    return {
+        "message": "Lesson Plan API is running",
+        "version": "0.5.0",
+        "template_exists": TEMPLATE_PATH.exists(),
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok"
+    }
+
+
+@app.post("/generate-from-template")
+def generate_from_template(data: LessonDocxRequest):
+    filename = fill_template_docx(data)
+    file_url = f"{PUBLIC_BASE_URL}/files/{filename}"
+
+    return {
+        "success": True,
+        "message": "模板教案 Word 生成成功",
+        "filename": filename,
+        "file_url": file_url
+    }
+
+# ===== v0.6.0 修复：封面分页 + 日期格式标准化 =====
+import re as _re_for_date
+from docx.enum.text import WD_BREAK
+
+
+def format_chinese_date(date_text: str) -> str:
+    """
+    将日期统一转换为：2026 年 6 月 19 日
+    兼容：
+    2026/6/19
+    2026-6-19
+    2026.6.19
+    2026年6月19日
+    """
+    raw = value_or_default(date_text).strip()
+    if not raw:
+        return ""
+
+    match = _re_for_date.search(r"(\d{4})\D+(\d{1,2})\D+(\d{1,2})", raw)
+    if match:
+        year, month, day = match.groups()
+        return f"{int(year)} 年 {int(month)} 月 {int(day)} 日"
+
+    return raw
+
+
+def set_cover_paragraph_v2(paragraph, label: str, value: str, add_page_break: bool = False):
+    """
+    填充封面普通段落，并可在指定段落后添加分页符。
+    """
+    paragraph.clear()
+
+    label_run = paragraph.add_run(f"{label}：")
+    label_run.bold = True
+    label_run.font.name = "黑体"
+    label_run._element.rPr.rFonts.set(qn("w:eastAsia"), "黑体")
+    label_run.font.size = Pt(16)
+
+    value_run = paragraph.add_run(f"  {value or ''}  ")
+    value_run.underline = True
+    value_run.font.name = "宋体"
+    value_run._element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+    value_run.font.size = Pt(16)
+
+    if add_page_break:
+        paragraph.add_run().add_break(WD_BREAK.PAGE)
+
+
+def fill_cover_info(doc, data: LessonDocxRequest):
+    """
+    填充封面信息。
+    在“二级学院”后强制分页，使后面的教案表格从下一页开始。
+    """
+    cover_map = {
+        "课程名称": value_or_default(data.course_name),
+        "编写教师": value_or_default(data.teacher_name),
+        "授课班级": value_or_default(data.class_name),
+        "授课学期": value_or_default(data.semester),
+        "教研室（组）": value_or_default(getattr(data, "teaching_group", "")),
+        "二级学院": value_or_default(data.college)
+    }
+
+    for paragraph in doc.paragraphs:
+        text = paragraph.text.strip()
+        for label, value in cover_map.items():
+            if label in text:
+                set_cover_paragraph_v2(
+                    paragraph,
+                    label,
+                    value,
+                    add_page_break=(label == "二级学院")
+                )
+                break
+
+
+def insert_page_break_before_first_table(doc):
+    """
+    旧版分页函数保留为空，避免重复插入分页符。
+    当前分页由 fill_cover_info 在“二级学院”后完成。
+    """
+    return
+
+
+def fill_template_docx(data: LessonDocxRequest) -> str:
+    if not TEMPLATE_PATH.exists():
+        raise FileNotFoundError(f"模板文件不存在: {TEMPLATE_PATH}")
+
+    doc = Document(TEMPLATE_PATH)
+
+    # 填充封面，并在封面后分页
+    fill_cover_info(doc, data)
+
+    if len(doc.tables) == 0:
+        raise ValueError("模板中没有表格，无法填充。")
+
+    table = doc.tables[0]
+    lesson_data = data.lesson_data or LessonData()
+
+    formatted_date = format_chinese_date(data.lesson_date)
+
+    # 顶部基本信息区：只填写第一组授课班级和日期
+    # 同一个班级和上课时间只填写一次，不复制到右侧区域
+    set_cell_text(table.cell(0, 1), value_or_default(data.class_name))
+    set_cell_text(table.cell(0, 3), formatted_date)
+
+    # 主体内容区
+    set_cell_text(table.cell(4, 1), value_or_default(data.lesson_topic, "未填写授课章节"))
+    set_cell_text(table.cell(5, 1), build_objectives_text(lesson_data.teaching_objectives))
+
+    ideological_goal = value_or_default(
+        lesson_data.ideological_goal,
+        "结合本次课程内容，引导学生树立规范意识、工程意识和责任意识，培养精益求精的职业精神。"
+    )
+    set_cell_text(table.cell(6, 1), ideological_goal)
+
+    set_cell_text(table.cell(7, 1), build_key_difficult_text(lesson_data))
+
+    teaching_design = value_or_default(
+        lesson_data.teaching_design,
+        "本次课围绕授课主题展开，先通过案例或问题情境导入，引导学生明确学习任务；随后讲解核心知识点，结合提问、演示、案例分析和任务训练促进学生理解；最后进行课堂总结，帮助学生梳理知识结构。"
+    )
+    set_cell_text(table.cell(8, 1), teaching_design)
+
+    reflection = value_or_default(
+        lesson_data.reflection,
+        "本次课整体教学过程较为顺利，学生能够跟随课堂任务完成学习。后续教学中应结合学生反馈进一步优化案例设计和课堂互动，提高学生对重点难点内容的理解与应用能力。"
+    )
+    set_cell_text(table.cell(9, 1), reflection)
+
+    set_cell_text(table.cell(10, 1), build_references_text(lesson_data.references))
+
+    filename = f"template_lesson_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}.docx"
+    file_path = OUTPUT_DIR / filename
+    doc.save(file_path)
+
+    return filename
+# ===== v0.6.0 修复结束 =====
