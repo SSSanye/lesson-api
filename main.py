@@ -1,4 +1,6 @@
-from fastapi import FastAPI
+import os
+
+from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from datetime import datetime
@@ -19,7 +21,7 @@ TEMPLATE_PATH = TEMPLATE_DIR / "lesson_template.docx"
 OUTPUT_DIR.mkdir(exist_ok=True)
 TEMPLATE_DIR.mkdir(exist_ok=True)
 
-PUBLIC_BASE_URL = "http://159.75.10.144:8000"
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 app = FastAPI(title="Lesson Plan API", version="0.5.0")
 app.mount("/files", StaticFiles(directory=str(OUTPUT_DIR)), name="files")
@@ -236,9 +238,10 @@ def health():
 
 
 @app.post("/generate-from-template")
-def generate_from_template(data: LessonDocxRequest):
+def generate_from_template(data: LessonDocxRequest, request: Request):
     filename = fill_template_docx(data)
-    file_url = f"{PUBLIC_BASE_URL}/files/{filename}"
+    base_url = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
+    file_url = f"{base_url}/files/{filename}"
 
     return {
         "success": True,
@@ -273,25 +276,149 @@ def format_chinese_date(date_text: str) -> str:
     return raw
 
 
-def set_cover_paragraph_v2(paragraph, label: str, value: str, add_page_break: bool = False):
-    """
-    填充封面普通段落，并可在指定段落后添加分页符。
-    """
-    paragraph.clear()
+def _display_width(text: str) -> int:
+    width = 0
+    for char in text:
+        width += 2 if ord(char) > 127 else 1
+    return width
 
-    label_run = paragraph.add_run(f"{label}：")
-    label_run.bold = True
-    label_run.font.name = "黑体"
-    label_run._element.rPr.rFonts.set(qn("w:eastAsia"), "黑体")
-    label_run.font.size = Pt(16)
 
-    value_run = paragraph.add_run(f"  {value or ''}  ")
+def _pad_to_display_width(text: str, target_width: int) -> str:
+    current_width = _display_width(text)
+    if current_width >= target_width:
+        return text
+    return text + (" " * (target_width - current_width))
+
+
+def _center_pad_to_display_width(text: str, target_width: int) -> str:
+    text = text or ""
+    current_width = _display_width(text)
+    if current_width >= target_width:
+        return text
+
+    padding_width = target_width - current_width
+    left_padding = padding_width // 2
+    right_padding = padding_width - left_padding
+    return (" " * left_padding) + text + (" " * right_padding)
+
+
+def _run_has_page_break(run) -> bool:
+    return any(
+        br.get(qn("w:type")) == "page"
+        for br in run._element.xpath(".//w:br")
+    )
+
+
+def _paragraph_has_page_break(paragraph) -> bool:
+    return any(_run_has_page_break(run) for run in paragraph.runs)
+
+
+def _clear_run_text_keep_page_breaks(run):
+    for node in run._element.xpath(".//w:t | .//w:tab"):
+        parent = node.getparent()
+        if parent is not None:
+            parent.remove(node)
+
+
+def _disable_proofing(run):
+    rPr = run._element.get_or_add_rPr()
+    no_proof = OxmlElement("w:noProof")
+    rPr.append(no_proof)
+
+
+def set_cover_paragraph_v2(
+    paragraph,
+    label: str,
+    value: str,
+    add_page_break: bool = False,
+    max_width: int | None = None
+):
+    """
+    填充封面普通段落，复用模板中已有的下划线空白长度。
+    """
+    underline_runs = [
+        run for run in paragraph.runs
+        if run.underline and run.text and not run.text.strip() and not _run_has_page_break(run)
+    ]
+
+    if underline_runs:
+        underline_text = "".join(run.text for run in underline_runs)
+        target_width = _display_width(underline_text)
+        if max_width is not None:
+            target_width = min(target_width, max_width)
+
+        filled_text = _center_pad_to_display_width(value or "", target_width)
+
+        fill_run = underline_runs[0]
+        fill_run.text = filled_text
+        fill_run.underline = True
+        fill_run.bold = True
+
+        for run in underline_runs[1:]:
+            run.text = ""
+    else:
+        paragraph.clear()
+
+        label_run = paragraph.add_run(f"{label}：")
+        label_run.bold = True
+        label_run.font.name = "黑体"
+        label_run._element.rPr.rFonts.set(qn("w:eastAsia"), "黑体")
+        label_run.font.size = Pt(16)
+
+        fallback_width = max_width or 32
+        filled_text = _center_pad_to_display_width(value or "", fallback_width)
+        value_run = paragraph.add_run(filled_text)
+        value_run.underline = True
+        value_run.bold = True
+        value_run.font.name = "宋体"
+        value_run._element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+        value_run.font.size = Pt(16)
+
+    if add_page_break and not _paragraph_has_page_break(paragraph):
+        paragraph.add_run().add_break(WD_BREAK.PAGE)
+
+
+def set_college_cover_paragraph(paragraph, value: str, add_page_break: bool = False):
+    """
+    单独填充“二级学院”，避免 fallback 清空段落后破坏模板分页结构。
+    """
+    label = "二级学院"
+    label_seen = False
+    page_break_run = None
+
+    for run in paragraph.runs:
+        if not label_seen:
+            if label in run.text:
+                run.text = f"{label}："
+                run.bold = True
+                label_seen = True
+            continue
+
+        if _run_has_page_break(run):
+            page_break_run = page_break_run or run
+            _clear_run_text_keep_page_breaks(run)
+            run.underline = False
+        else:
+            run.text = ""
+
+    if not label_seen:
+        label_run = paragraph.add_run(f"{label}：")
+        label_run.bold = True
+        label_run.font.name = "黑体"
+        label_run._element.rPr.rFonts.set(qn("w:eastAsia"), "黑体")
+        label_run.font.size = Pt(16)
+
+    value_run = paragraph.add_run(f"\u3000\u3000{value or ''}\u3000\u3000")
     value_run.underline = True
-    value_run.font.name = "宋体"
-    value_run._element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+    value_run.bold = True
+    value_run.font.name = "黑体"
+    value_run._element.rPr.rFonts.set(qn("w:eastAsia"), "黑体")
     value_run.font.size = Pt(16)
+    _disable_proofing(value_run)
 
-    if add_page_break:
+    if page_break_run is not None:
+        page_break_run._element.addprevious(value_run._element)
+    elif add_page_break and not _paragraph_has_page_break(paragraph):
         paragraph.add_run().add_break(WD_BREAK.PAGE)
 
 
@@ -313,12 +440,10 @@ def fill_cover_info(doc, data: LessonDocxRequest):
         text = paragraph.text.strip()
         for label, value in cover_map.items():
             if label in text:
-                set_cover_paragraph_v2(
-                    paragraph,
-                    label,
-                    value,
-                    add_page_break=(label == "二级学院")
-                )
+                if label == "二级学院":
+                    set_college_cover_paragraph(paragraph, value, add_page_break=True)
+                else:
+                    set_cover_paragraph_v2(paragraph, label, value)
                 break
 
 
