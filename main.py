@@ -1,4 +1,5 @@
 import os
+from copy import deepcopy
 
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
@@ -8,6 +9,7 @@ from uuid import uuid4
 from pathlib import Path
 
 from docx import Document
+from docx.table import Table
 from docx.shared import Pt
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
@@ -43,7 +45,58 @@ class LessonData(BaseModel):
     references: list[str] | None = None
 
 
+class CourseInfo(BaseModel):
+    course_name: str | None = None
+    teacher_name: str | None = None
+    class_name: str | None = None
+    semester: str | None = None
+    college: str | None = None
+    teaching_group: str | None = None
+
+
+class SemesterBasicInfo(BaseModel):
+    college: str | None = None
+    course_name: str | None = None
+    teacher_name: str | None = None
+    class_name: str | None = None
+    semester: str | None = None
+    teaching_group: str | None = None
+    teaching_date: str | None = None
+    period: str | None = None
+    hours: str | None = None
+
+
+class SemesterObjectives(BaseModel):
+    knowledge_goal: str | None = None
+    ability_goal: str | None = None
+    quality_goal: str | None = None
+    knowledge: str | None = None
+    ability: str | None = None
+    quality: str | None = None
+
+
+class SemesterLessonContent(BaseModel):
+    chapter: str | None = None
+    objectives: SemesterObjectives | None = None
+    ideological_goal: str | None = None
+    key_points: str | None = None
+    difficult_points: str | None = None
+    teaching_design: str | None = None
+    reflection: str | None = None
+    references: list[str] | None = None
+
+
+class SemesterLessonItem(BaseModel):
+    lesson_no: str | None = None
+    basic_info: SemesterBasicInfo | None = None
+    lesson_content: SemesterLessonContent | None = None
+    generation_trace: dict | None = None
+
+
 class LessonDocxRequest(BaseModel):
+    generation_mode: str | None = None
+    course_info: CourseInfo | None = None
+    lessons: list[SemesterLessonItem] | None = None
     course_name: str | None = None
     lesson_topic: str | None = None
     teacher_name: str | None = None
@@ -99,7 +152,7 @@ def build_references_text(references: list[str] | None) -> str:
         "[3] 童诗白, 华成英. 模拟电子技术基础[M]. 北京: 高等教育出版社, 2015."
     ]
 
-    refs = references or default_refs
+    refs = references if references is not None else default_refs
     return "\n".join(refs)
 
 
@@ -239,7 +292,11 @@ def health():
 
 @app.post("/generate-from-template")
 def generate_from_template(data: LessonDocxRequest, request: Request):
-    filename = fill_template_docx(data)
+    if data.generation_mode == "semester":
+        filename = fill_semester_template_docx(data)
+    else:
+        filename = fill_template_docx(data)
+
     base_url = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
     file_url = f"{base_url}/files/{filename}"
 
@@ -455,30 +512,50 @@ def insert_page_break_before_first_table(doc):
     return
 
 
-def fill_template_docx(data: LessonDocxRequest) -> str:
-    if not TEMPLATE_PATH.exists():
-        raise FileNotFoundError(f"模板文件不存在: {TEMPLATE_PATH}")
+def _create_page_break_paragraph():
+    p = OxmlElement("w:p")
+    r = OxmlElement("w:r")
+    br = OxmlElement("w:br")
+    br.set(qn("w:type"), "page")
+    r.append(br)
+    p.append(r)
+    return p
 
-    doc = Document(TEMPLATE_PATH)
 
-    # 填充封面，并在封面后分页
-    fill_cover_info(doc, data)
+def _element_has_page_break(element) -> bool:
+    return any(
+        br.get(qn("w:type")) == "page"
+        for br in element.xpath(".//w:br")
+    )
 
-    if len(doc.tables) == 0:
-        raise ValueError("模板中没有表格，无法填充。")
 
-    table = doc.tables[0]
-    lesson_data = data.lesson_data or LessonData()
+def _has_page_break_before_element(element) -> bool:
+    previous = element.getprevious()
+    while previous is not None:
+        if previous.tag != qn("w:p"):
+            return False
+        if _element_has_page_break(previous):
+            return True
+        previous = previous.getprevious()
+    return False
 
-    formatted_date = format_chinese_date(data.lesson_date)
+
+def ensure_page_break_before_table(table):
+    if not _has_page_break_before_element(table._tbl):
+        table._tbl.addprevious(_create_page_break_paragraph())
+
+
+def fill_lesson_table(table, lesson: LessonDocxRequest):
+    lesson_data = lesson.lesson_data or LessonData()
+    formatted_date = format_chinese_date(lesson.lesson_date)
 
     # 顶部基本信息区：只填写第一组授课班级和日期
     # 同一个班级和上课时间只填写一次，不复制到右侧区域
-    set_cell_text(table.cell(0, 1), value_or_default(data.class_name))
+    set_cell_text(table.cell(0, 1), value_or_default(lesson.class_name))
     set_cell_text(table.cell(0, 3), formatted_date)
 
     # 主体内容区
-    set_cell_text(table.cell(4, 1), value_or_default(data.lesson_topic, "未填写授课章节"))
+    set_cell_text(table.cell(4, 1), value_or_default(lesson.lesson_topic, "未填写授课章节"))
     set_cell_text(table.cell(5, 1), build_objectives_text(lesson_data.teaching_objectives))
 
     ideological_goal = value_or_default(
@@ -502,6 +579,114 @@ def fill_template_docx(data: LessonDocxRequest) -> str:
     set_cell_text(table.cell(9, 1), reflection)
 
     set_cell_text(table.cell(10, 1), build_references_text(lesson_data.references))
+
+
+def _semester_lesson_to_docx_request(course_info: CourseInfo, lesson: SemesterLessonItem) -> LessonDocxRequest:
+    basic_info = lesson.basic_info or SemesterBasicInfo()
+    content = lesson.lesson_content or SemesterLessonContent()
+    objectives = content.objectives or SemesterObjectives()
+
+    teaching_objectives = TeachingObjectives(
+        knowledge=objectives.knowledge_goal or objectives.knowledge,
+        ability=objectives.ability_goal or objectives.ability,
+        quality=objectives.quality_goal or objectives.quality
+    )
+
+    lesson_data = LessonData(
+        teaching_objectives=teaching_objectives,
+        ideological_goal=content.ideological_goal,
+        key_points=content.key_points,
+        difficult_points=content.difficult_points,
+        teaching_design=content.teaching_design,
+        reflection=content.reflection,
+        references=content.references
+    )
+
+    return LessonDocxRequest(
+        course_name=basic_info.course_name or course_info.course_name,
+        lesson_topic=content.chapter,
+        teacher_name=basic_info.teacher_name or course_info.teacher_name,
+        class_name=basic_info.class_name or course_info.class_name,
+        semester=basic_info.semester or course_info.semester,
+        college=basic_info.college or course_info.college,
+        teaching_group=basic_info.teaching_group or course_info.teaching_group,
+        lesson_date=basic_info.teaching_date,
+        lesson_time=basic_info.period,
+        hours=basic_info.hours,
+        lesson_data=lesson_data
+    )
+
+
+def fill_semester_template_docx(data: LessonDocxRequest) -> str:
+    if not TEMPLATE_PATH.exists():
+        raise FileNotFoundError(f"模板文件不存在: {TEMPLATE_PATH}")
+
+    if not data.lessons:
+        raise ValueError("多次课生成需要提供 lessons 数组。")
+
+    doc = Document(TEMPLATE_PATH)
+
+    course_info = data.course_info or CourseInfo(
+        course_name=data.course_name,
+        teacher_name=data.teacher_name,
+        class_name=data.class_name,
+        semester=data.semester,
+        college=data.college,
+        teaching_group=data.teaching_group
+    )
+    cover_data = LessonDocxRequest(
+        course_name=course_info.course_name,
+        teacher_name=course_info.teacher_name,
+        class_name=course_info.class_name,
+        semester=course_info.semester,
+        college=course_info.college,
+        teaching_group=course_info.teaching_group
+    )
+
+    fill_cover_info(doc, cover_data)
+
+    if len(doc.tables) == 0:
+        raise ValueError("模板中没有表格，无法填充。")
+
+    first_table = doc.tables[0]
+    blank_table_xml = deepcopy(first_table._tbl)
+
+    ensure_page_break_before_table(first_table)
+    fill_lesson_table(first_table, _semester_lesson_to_docx_request(course_info, data.lessons[0]))
+
+    last_table_element = first_table._tbl
+    for lesson in data.lessons[1:]:
+        page_break = _create_page_break_paragraph()
+        new_table_xml = deepcopy(blank_table_xml)
+
+        last_table_element.addnext(page_break)
+        page_break.addnext(new_table_xml)
+
+        new_table = Table(new_table_xml, doc)
+        fill_lesson_table(new_table, _semester_lesson_to_docx_request(course_info, lesson))
+        last_table_element = new_table_xml
+
+    filename = f"semester_lesson_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}.docx"
+    file_path = OUTPUT_DIR / filename
+    doc.save(file_path)
+
+    return filename
+
+
+def fill_template_docx(data: LessonDocxRequest) -> str:
+    if not TEMPLATE_PATH.exists():
+        raise FileNotFoundError(f"模板文件不存在: {TEMPLATE_PATH}")
+
+    doc = Document(TEMPLATE_PATH)
+
+    # 填充封面，并在封面后分页
+    fill_cover_info(doc, data)
+
+    if len(doc.tables) == 0:
+        raise ValueError("模板中没有表格，无法填充。")
+
+    table = doc.tables[0]
+    fill_lesson_table(table, data)
 
     filename = f"template_lesson_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}.docx"
     file_path = OUTPUT_DIR / filename
